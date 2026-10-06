@@ -8262,6 +8262,39 @@ async function generateBookSetupWithAI(params){
     high: '请保留同一核心灵感与人物基础，但允许在书名、人物配置包装、故事卖点、关系呈现方式、剧情钩子上做明显差异。'
   };
 
+  function normalizeSingleBookResult(obj){
+    return {
+      title: obj.title || '未命名书籍',
+      author: obj.author || 'AI作者',
+      category: obj.category || '原创-言情-近代现代-爱情',
+      oneline: obj.oneline || '',
+      intro: obj.intro || '',
+      theme: obj.theme || '',
+      tags: safeArray(obj.tags),
+      keywords: safeArray(obj.keywords),
+      defaultSettings: Object.assign({
+        chapterWordCount: defaultChapterWordCount,
+        style: style || '',
+        direction: ''
+      }, obj.defaultSettings || {})
+    };
+  }
+
+  function parseBookArrayFromText(rawText){
+    const text = stripMarkdownCodeFence(String(rawText || '').trim());
+    if(!text) return [];
+
+    const blocks = text
+      .split(/\n\s*\n(?=书名[：:])/)
+      .map(s=>s.trim())
+      .filter(Boolean);
+
+    const results = blocks.map(block=>parseStructuredBookText(block))
+      .filter(item=>String(item.title || '').trim());
+
+    return results.map(normalizeSingleBookResult);
+  }
+
   function buildPromptExtraRules(isMulti){
     return isMulti
       ? `【额外要求】
@@ -8277,41 +8310,33 @@ async function generateBookSetupWithAI(params){
 10. 标签 4~8 个
 11. direction 用简洁语言概括剧情走向
 12. defaultSettings.chapterWordCount 请优先按照玩家默认设定输出，如无特殊必要不要改小
-13. 只输出 JSON 数组`
+13. 只输出 JSON`
       : `【额外要求】
 1. 书名要有中文网文感、平台感、记忆点
 2. 一句话简介控制在20~40字
 3. 长文案控制在120~260字
 4. 文案必须有钩子，不能只是设定总结
-5. 如果题材偏轻喜、沙雕、都市、职场、搞笑恋爱、纯爱轻喜，可以在文案中加入一小段“人物名场面式段子”
-6. 这类段子要体现角色反差、人物化学反应和关系张力，不要只是无意义搞笑
-7. 如果是言情、纯爱、百合、多男主、多女主、修罗场、买股文，文案中必须尽量明确写出主角配置
-8. 如果人物名字已经明确，优先采用“人设标签（名字）vs 人设标签（名字）”或“人设标签（名字）vs 人设标签（名字）vs 人设标签（名字）”格式
-9. 标签 4~8 个
-10. direction 用简洁语言概括剧情走向
-11. defaultSettings.chapterWordCount 请优先按照玩家默认设定输出，如无特殊必要不要改小
-12. 只输出 JSON`;
+5. 如果是关系向小说，尽量明确写出主角配置
+6. 如果题材适合，可以自然加入“人物名场面式段子”
+7. 标签 4~8 个
+8. direction 用简洁语言概括剧情走向
+9. defaultSettings.chapterWordCount 请优先按照玩家默认设定输出，如无特殊必要不要改小
+10. 只输出 JSON 或严格字段文本`;
   }
 
-  async function runBookRequest(mode){
+  async function runBookRequest(mode, singleCount){
     const isJson = mode === 'json';
-    const wantsArray = count > 1;
+    const wantsArray = Number(singleCount || count) > 1;
 
     const systemPrompt = `你是中文网文平台的小说策划编辑，擅长生成适合女频、纯爱、关系流、剧情流小说的书名、主角配置展示、一句话简介与平台文案。
 你输出的内容必须像真正的网文平台书籍文案，具备阅读钩子、情绪张力、人物卖点和平台感。
-你尤其擅长以下几类文案：
-1. 晋江风细腻情感流文案
-2. 轻喜、职场、反差萌、段子型文案
-3. 反套路、修罗场、多人关系文案
-4. 虐恋、破镜重圆、遗憾感文案
-
 不要解释，不要分析过程，只输出用户要求的结果。`;
 
     let userPrompt = '';
 
     if(isJson){
       if(wantsArray){
-        userPrompt = `请根据以下灵感，一次生成 ${count} 本“同核心、不同包装版本”的小说设定。
+        userPrompt = `请根据以下灵感，一次生成 ${singleCount || count} 本“同核心、不同包装版本”的小说设定。
 
 只输出合法 JSON 数组，不要输出解释，不要输出 markdown 代码块。
 
@@ -8354,20 +8379,6 @@ ${worldPrompt || '无'}
 ${copywritingRules}
 
 【多版本变体生成要求】
-你现在要生成同一批次的多个版本。
-这些版本可以共用相似核心设定、人物基础、题材方向。
-但是每一个版本都要在以下方面体现差异：
-1. 书名不同
-2. 一句话简介表达不同
-3. 长文案切入角度不同
-4. 主角配置展示方式或卖点重心不同
-5. 卖点包装不同
-6. 关系张力的强调重点可以不同
-7. 剧情走向描述可相近，但不要完全重复
-8. 如果是轻喜/反差萌/搞笑恋爱题材，不同版本可选择不同“名场面式段子”切入口
-9. 如果是虐恋/破镜重圆题材，不同版本可选择不同情绪切入口
-10. 如果是修罗场/买股文，不同版本可选择不同核心关系组合重心
-
 ${variantRuleMap[variantLevel] || variantRuleMap.medium}
 
 ${buildPromptExtraRules(true)}`;
@@ -8416,29 +8427,22 @@ ${buildPromptExtraRules(false)}`;
       }
     }else{
       if(wantsArray){
-        userPrompt = `请根据以下灵感，一次生成 ${count} 本“同核心、不同包装版本”的小说设定。
+        userPrompt = `请根据以下灵感，一次生成 ${singleCount || count} 本“同核心、不同包装版本”的小说设定。
 
 不要输出解释，不要输出 markdown。
-请严格按 JSON 数组格式输出。
+如果无法稳定输出 JSON，请按下面字段文本输出，每本书之间空一行：
 
-每一项格式：
-{
-  "title": "",
-  "author": "",
-  "category": "",
-  "oneline": "",
-  "intro": "",
-  "theme": "",
-  "tags": [],
-  "keywords": [],
-  "defaultSettings": {
-    "chapterWordCount": ${defaultChapterWordCount},
-    "style": "",
-    "direction": "",
-    "narrativePerson": "third",
-    "protagonistName": ""
-  }
-}
+书名：...
+作者：...
+分类：...
+一句话简介：...
+文案：...
+立意：...
+标签：标签1，标签2
+关键词：关键词1，关键词2
+默认章节字数：${defaultChapterWordCount}
+默认文风：...
+大致走向：...
 
 【用户灵感】
 ${prompt}
@@ -8465,7 +8469,7 @@ ${buildPromptExtraRules(true)}`;
         userPrompt = `请根据以下灵感生成一本小说设定。
 
 不要输出解释，不要输出 markdown。
-请严格按以下结构输出：
+请严格按以下字段输出：
 
 书名：...
 作者：...
@@ -8506,116 +8510,130 @@ ${copywritingRules}
       }
     }
 
-    const resp = await callChatJSON(
+    const resp = await callChatWithAutoStreamFallback(
       [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt }
       ],
       {
         temperature: Number(state.settings.creativeTemperature ?? 0.72),
-        max_tokens: Math.min(Number(state.settings.maxTokens || 6000), 12000)
+        max_tokens: Math.min(Number(state.settings.maxTokens || 6000), 12000),
+        timeoutMs: 240000
       }
     );
 
-    const raw = resp.content;
+    const raw = String(resp.content || '').trim();
     console.log('【新书生成原始返回】', raw);
+if(!isValidModelTextOutput(raw)){
+  throw new Error('新书生成返回疑似为接口元数据，不是有效内容');
+}
     console.log('【新书生成finish_reason】', resp.finishReason);
     console.log('【新书生成usage】', resp.usage);
 
     if(isJson){
-      const obj = extractJSON(raw);
+      try{
+        const obj = extractJSON(raw);
 
-      if(wantsArray){
-        if(!Array.isArray(obj)){
+        if(wantsArray){
+          if(Array.isArray(obj)){
+            return obj.map(normalizeSingleBookResult);
+          }
+          if(obj && Array.isArray(obj.books)){
+            return obj.books.map(normalizeSingleBookResult);
+          }
           throw new Error('模型返回的不是数组');
+        }else{
+          return normalizeSingleBookResult(obj);
+        }
+      }catch(jsonErr){
+        console.warn('【新书JSON解析失败，尝试文本兜底】', jsonErr);
+
+        if(!wantsArray){
+          const parsed = parseStructuredBookText(raw);
+          if(String(parsed.title || '').trim()){
+            return normalizeSingleBookResult(parsed);
+          }
+        }else{
+          const parsedList = parseBookArrayFromText(raw);
+          if(parsedList.length){
+            return parsedList.slice(0, singleCount || count);
+          }
         }
 
-        return obj.map(item=>({
-          title: item.title || '未命名书籍',
-          author: item.author || 'AI作者',
-          category: item.category || '原创-言情-近代现代-爱情',
-          oneline: item.oneline || '',
-          intro: item.intro || '',
-          theme: item.theme || '',
-          tags: safeArray(item.tags),
-          keywords: safeArray(item.keywords),
-          defaultSettings: Object.assign({
-            chapterWordCount: defaultChapterWordCount,
-            style: style || '',
-            direction: ''
-          }, item.defaultSettings || {})
-        }));
-      }else{
-        return {
-          title: obj.title || '未命名书籍',
-          author: obj.author || 'AI作者',
-          category: obj.category || '原创-言情-近代现代-爱情',
-          oneline: obj.oneline || '',
-          intro: obj.intro || '',
-          theme: obj.theme || '',
-          tags: safeArray(obj.tags),
-          keywords: safeArray(obj.keywords),
-          defaultSettings: Object.assign({
-            chapterWordCount: defaultChapterWordCount,
-            style: style || '',
-            direction: ''
-          }, obj.defaultSettings || {})
-        };
+        throw jsonErr;
       }
     }else{
-      throw new Error('当前批量模式仅支持 JSON 返回，请切换兼容模型后重试');
+      if(wantsArray){
+        const parsedList = parseBookArrayFromText(raw);
+        if(parsedList.length){
+          return parsedList.slice(0, singleCount || count);
+        }
+        throw new Error('批量文本模式解析失败');
+      }else{
+        const parsed = parseStructuredBookText(raw);
+        if(String(parsed.title || '').trim()){
+          return normalizeSingleBookResult(parsed);
+        }
+        throw new Error('单本文本模式解析失败');
+      }
     }
   }
 
   try{
-    return await runBookRequest('json');
-  }catch(err1){
-    console.warn('【新书生成JSON模式失败】', err1);
-    throw new Error('AI生成新书失败，请尝试更换模型/API，或减少提示词复杂度。原始错误：' + (err1.message || err1));
-  }
-}
-async function testApiConnection(){
-  const preset = getCurrentApiPreset();
-  if(!preset) return {ok:false,message:'请先创建 API 预设'};
-  if(!preset.apiKey) return {ok:false,message:'请先填写 API Key'};
+    if(count === 1){
+      try{
+        return await runBookRequest('json', 1);
+      }catch(errJson){
+        console.warn('【单本新书JSON失败，回退文本模式】', errJson);
+        return await runBookRequest('text', 1);
+      }
+    }
 
-  const url = preset.apiBaseUrl.replace(/\/$/,'') + '/chat/completions';
+    // 批量优先 JSON 数组
+    try{
+      const arr = await runBookRequest('json', count);
+      if(Array.isArray(arr) && arr.length) return arr;
+      throw new Error('批量 JSON 返回为空');
+    }catch(errBatch){
+      console.warn('【批量新书JSON失败，尝试文本批量】', errBatch);
 
-  try{
-    const payload = {
-      model: preset.model || 'gpt-4o-mini',
-      messages: [{role:'user',content:'请只回复ok'}],
-      temperature: 0,
-      max_tokens: 20
-    };
+      try{
+        const arr2 = await runBookRequest('text', count);
+        if(Array.isArray(arr2) && arr2.length) return arr2;
+        throw new Error('批量文本返回为空');
+      }catch(errTextBatch){
+        console.warn('【批量文本也失败，回退为逐本生成】', errTextBatch);
 
-    console.log('【测试连接请求】', url, payload);
+        const results = [];
+        for(let i = 0; i < count; i++){
+          try{
+            const single = await runBookRequest('json', 1);
+            results.push(single);
+          }catch(errSingleJson){
+            console.warn(`【第 ${i+1} 本 JSON 失败，尝试文本】`, errSingleJson);
+            const singleText = await runBookRequest('text', 1);
+            results.push(singleText);
+          }
+        }
 
-    const res = await fetch(url,{
-      method:'POST',
-      headers:{
-        'Content-Type':'application/json',
-        'Authorization':'Bearer ' + preset.apiKey
-      },
-      body: JSON.stringify(payload)
-    });
+        if(results.length){
+          return results;
+        }
 
-if(!res.ok){
-  const text = await res.text();
-  console.error('【测试连接失败响应】', res.status, text);
-  const msg = extractErrorMessage(text);
-  const humanMsg = simplifyApiError(res.status, msg);
-  return {ok:false,message: humanMsg};
-}
-
-
-    const data = await res.json();
-    console.log('【测试连接成功响应】', data);
-
-    const content = ((((data||{}).choices||[])[0]||{}).message||{}).content || '';
-    return {ok:true,message:'连接成功：' + String(content).trim().slice(0,60)};
-  }catch(e){
-    return {ok:false,message:'请求失败：' + (e.message||e)};
+        throw errTextBatch;
+      }
+    }
+  }catch(errFinal){
+    console.error('【AI生成新书最终失败】', errFinal);
+    throw new Error(
+      'AI生成新书失败。\n' +
+      '建议尝试：\n' +
+      '1. 更换更稳定的模型/API\n' +
+      '2. 减少生成数量\n' +
+      '3. 缩短灵感描述\n' +
+      '4. 降低提示词复杂度\n\n' +
+      '原始错误：' + (errFinal.message || errFinal)
+    );
   }
 }
 
@@ -8812,14 +8830,16 @@ async function callChatJSONWithPreset(preset, messages, options){
       }
     }
 
-    if(plain){
-      return {
-        content: plain,
-        finishReason: '',
-        usage: null,
-        raw: plain
-      };
-    }
+if(plain && isValidModelTextOutput(plain)){
+  return {
+    content: plain,
+    finishReason: '',
+    usage: null,
+    raw: plain
+  };
+}
+
+throw new Error('接口返回了非JSON文本，但内容疑似为API元数据，不写入正文。');
 
     throw new Error('接口返回不是合法JSON，且返回体为空，无法继续解析。');
   }
@@ -8927,42 +8947,38 @@ async function callChatJSONWithPreset(preset, messages, options){
   // 兜底2：JSON 结构正常，但正文字段不标准
   // 如果整个 JSON 里能扁平提取出一段文本，也直接返回
   // =========================
-  if(!content){
-    const flattenedFallback = String(flattenAnyText(data) || '').trim();
+if(!content){
+  const flattenedFallback = String(flattenAnyText(data) || '').trim();
 
-    if(
-      flattenedFallback &&
-      flattenedFallback !== '[object Object]' &&
-      flattenedFallback !== '{}' &&
-      flattenedFallback !== '[]'
-    ){
-      content = flattenedFallback;
-    }
+  if(
+    flattenedFallback &&
+    flattenedFallback !== '[object Object]' &&
+    flattenedFallback !== '{}' &&
+    flattenedFallback !== '[]' &&
+    isValidModelTextOutput(flattenedFallback)
+  ){
+    content = flattenedFallback;
+  }
+}
+
+if(!content){
+  console.error('【未解析到正文，完整响应】', data);
+
+  const fallbackRaw = String(rawText || '').trim();
+  if(fallbackRaw && isValidModelTextOutput(fallbackRaw)){
+    return {
+      content: fallbackRaw,
+      finishReason: choice.finish_reason || '',
+      usage: data.usage || null,
+      raw: data
+    };
   }
 
-  if(!content){
-    console.error('【未解析到正文，完整响应】', data);
-
-    // =========================
-    // 兜底3：如果原始 rawText 本身有内容，就直接返回 rawText
-    // 这样上层还能继续做 extractJSON / 纯文本兜底
-    // =========================
-    const fallbackRaw = String(rawText || '').trim();
-    if(fallbackRaw){
-      return {
-        content: fallbackRaw,
-        finishReason: choice.finish_reason || '',
-        usage: data.usage || null,
-        raw: data
-      };
-    }
-
-    throw new Error(
-      '模型有返回，但前端未能从响应结构中解析到正文。' +
-      'finish_reason=' + (choice.finish_reason || 'unknown') +
-      '。请打开控制台查看【API响应JSON】和【message原始内容】。'
-    );
-  }
+  throw new Error(
+    '模型有返回，但正文解析失败，且返回内容疑似为 API 元数据，不写入正文。' +
+    ' finish_reason=' + (choice.finish_reason || 'unknown')
+  );
+}
 
   return {
     content,
@@ -10457,13 +10473,78 @@ function isEmptyChunkShellText(text){
     )
   );
 }
+function looksLikeApiMetaGarbage(text){
+  const raw = String(text || '').trim();
+  if(!raw) return false;
+
+  const lower = raw.toLowerCase();
+
+  // 明显的 API / 中转层元数据痕迹
+  if(
+    lower.includes('chatcmpl-') ||
+    lower.includes('chat.completion') ||
+    lower.includes('chat.completion.chunk') ||
+    lower.includes('gemini-3.1-pro-preview') ||
+    lower.includes('gemini_chat') ||
+    lower.includes('"assistant"') ||
+    lower.includes('"choices"') ||
+    lower.includes('"usage"') ||
+    lower.includes('"completion_tokens"') ||
+    lower.includes('"prompt_tokens"') ||
+    lower.includes('"object"') ||
+    lower.includes('"model"') ||
+    lower.includes('"finish_reason"')
+  ){
+    return true;
+  }
+
+  // 像截图那种连续拼接元数据串
+  if(
+    /^chatcmpl-[\w\-]+/i.test(raw) ||
+    /chatcmpl-[\w\-]+.*assistant.*\d{6,}/i.test(raw)
+  ){
+    return true;
+  }
+
+  // 整段几乎没有自然语言、却充满接口字段
+  const suspiciousFieldHits = [
+    'chatcmpl-','assistant','usage','choices','prompt_tokens',
+    'completion_tokens','chat.completion','model','object','gemini'
+  ].filter(k => lower.includes(k)).length;
+
+  if(suspiciousFieldHits >= 3 && raw.length > 40){
+    return true;
+  }
+
+  return false;
+}
+
+function isValidModelTextOutput(text){
+  const raw = String(text || '').trim();
+  if(!raw) return false;
+  if(isEmptyChunkShellText(raw)) return false;
+  if(looksLikeApiMetaGarbage(raw)) return false;
+  return true;
+}
+
+function sanitizeGeneratedNovelContent(text){
+  const raw = normalizeTextOutput(text);
+  if(!raw) return '';
+
+  if(!isValidModelTextOutput(raw)){
+    console.warn('【正文拦截】检测到疑似API元数据，拒绝写入正文：', raw);
+    return '';
+  }
+
+  return raw;
+}
 
 function parseForumRepliesFromPlainText(rawText, fallbackName){
   const text = String(rawText || '').trim();
   if(!text) return [];
 
-  if(isEmptyChunkShellText(text)){
-    console.warn('【论坛回复纯文本解析拦截】检测到空chunk壳，拒绝解析', text);
+  if(isEmptyChunkShellText(text) || looksLikeApiMetaGarbage(text)){
+    console.warn('【论坛回复纯文本解析拦截】检测到空chunk壳或API元数据，拒绝解析', text);
     return [];
   }
 
@@ -18124,17 +18205,17 @@ ${params.guide || '无'}
         };
       }
 
-      const fallbackRaw = normalizeTextOutput(String(raw || ''));
-      if(fallbackRaw.length > 80 && !isEmptyChunkShellText(fallbackRaw)){
-        return {
-          title: '第一章',
-          content: fallbackRaw,
-          isPartial: true,
-          finishReason: resp.finishReason || 'raw_fallback',
-          usage: resp.usage || null,
-          rawText: raw
-        };
-      }
+const fallbackRaw = sanitizeGeneratedNovelContent(String(raw || ''));
+if(fallbackRaw.length > 80){
+  return {
+    title: '第一章',
+    content: fallbackRaw,
+    isPartial: true,
+    finishReason: resp.finishReason || 'raw_fallback',
+    usage: resp.usage || null,
+    rawText: raw
+  };
+}
 
       throw jsonErr;
     }
@@ -18990,17 +19071,17 @@ ${resolvedRecentEventsPrompt || '暂无已完成事件。'}
           };
         }
 
-        const fallbackRaw = normalizeTextOutput(String(raw || ''));
-        if(fallbackRaw.length > 50){
-          return {
-            title: '未命名章节',
-            content: fallbackRaw,
-            isPartial: true,
-            finishReason: resp.finishReason || 'raw_fallback',
-            usage: resp.usage,
-            rawText: raw
-          };
-        }
+const fallbackRaw = sanitizeGeneratedNovelContent(String(raw || ''));
+if(fallbackRaw.length > 50){
+  return {
+    title: '未命名章节',
+    content: fallbackRaw,
+    isPartial: true,
+    finishReason: resp.finishReason || 'raw_fallback',
+    usage: resp.usage,
+    rawText: raw
+  };
+}
 
         throw jsonErr;
       }
@@ -19017,17 +19098,17 @@ ${resolvedRecentEventsPrompt || '暂无已完成事件。'}
         };
       }
 
-      const fallbackRaw = normalizeTextOutput(String(raw || ''));
-      if(fallbackRaw.length > 50){
-        return {
-          title: '未命名章节',
-          content: fallbackRaw,
-          isPartial: true,
-          finishReason: resp.finishReason || 'text_raw_fallback',
-          usage: resp.usage,
-          rawText: raw
-        };
-      }
+const fallbackRaw = sanitizeGeneratedNovelContent(String(raw || ''));
+if(fallbackRaw.length > 50){
+  return {
+    title: '未命名章节',
+    content: fallbackRaw,
+    isPartial: true,
+    finishReason: resp.finishReason || 'text_raw_fallback',
+    usage: resp.usage,
+    rawText: raw
+  };
+}
 
       throw new Error('章节正文文本解析失败');
     }
@@ -24091,7 +24172,8 @@ function renderChapterReaderPage(){
   const isFirst = idx <= 0;
   const isLast = idx === list.length - 1;
 
-  const paragraphs = splitChapterParagraphs(ch.content);
+  const safeReaderContent = looksLikeApiMetaGarbage(ch.content) ? '【已拦截异常内容：该章节正文疑似为接口元数据，请手动重生成或从废稿恢复】' : ch.content;
+const paragraphs = splitChapterParagraphs(safeReaderContent);
   const allDraftCount =
     safeArray(ch.drafts).length +
     safeArray(book.tempDrafts).length;
@@ -31424,8 +31506,8 @@ function parseCommentLinesFromPlainText(rawText, fallbackName){
   const text = String(rawText || '').trim();
   if(!text) return [];
 
-  if(isEmptyChunkShellText(text)){
-    console.warn('【评论纯文本解析拦截】检测到空chunk壳，拒绝当作评论解析', text);
+  if(isEmptyChunkShellText(text) || looksLikeApiMetaGarbage(text)){
+    console.warn('【评论纯文本解析拦截】检测到空chunk壳或API元数据，拒绝当作评论解析', text);
     return [];
   }
 
@@ -31554,8 +31636,8 @@ function parseForumPostsFromPlainText(rawText, options){
   const text = stripAiReasoningPrefix(String(rawText || '').trim());
   if(!text) return [];
 
-  if(isEmptyChunkShellText(text)){
-    console.warn('【论坛帖子纯文本解析拦截】检测到空chunk壳，拒绝当作帖子解析', text);
+  if(isEmptyChunkShellText(text) || looksLikeApiMetaGarbage(text)){
+    console.warn('【论坛帖子纯文本解析拦截】检测到空chunk壳或API元数据，拒绝当作帖子解析', text);
     return [];
   }
 
@@ -32791,7 +32873,12 @@ function openGenerateChapterModal(isRegenerate){
             });
 
             currentCh.title = result.title;
-            currentCh.content = result.content;
+            const safeCurrentContent = sanitizeGeneratedNovelContent(result.content);
+if(!safeCurrentContent){
+  throw new Error('生成结果疑似为接口元数据，不是有效正文，已拦截保存。');
+}
+currentCh.content = safeCurrentContent;
+
             currentCh.summary = '';
             currentCh.summaryStructured = {
               time:'',
@@ -32857,7 +32944,14 @@ currentCh.highlights = [];
               id: generateId('chapter'),
               index: nextIndex,
               title: result.title,
-              content: result.content,
+              content: (() => {
+  const safeNewContent = sanitizeGeneratedNovelContent(result.content);
+  if(!safeNewContent){
+    throw new Error('生成结果疑似为接口元数据，不是有效正文，已拦截保存。');
+  }
+  return safeNewContent;
+})(),
+
               summary: '',
               summaryStructured: {
                 time:'',
