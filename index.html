@@ -2532,25 +2532,51 @@ function buildRelationshipSummaryForComments(book, chapter){
 
 function buildCommentQuotePromptText(book, chapter){
   const chapterNames = collectCommentContextNames(book, chapter);
-  const quoteList = safeArray(state.quotes)
-    .slice(0, 12)
-    .map(item=>{
-      const text = replaceCommentPlaceholderNames(String(item.content || '').trim(), chapterNames);
-      if(!text) return '';
-      return `- ${text}`;
-    })
-    .filter(Boolean);
 
-  return quoteList.join('\n');
+  // 按风格分组，每种风格最多取2条作为"语感参考"
+  const grouped = {};
+  safeArray(state.quotes).forEach(item=>{
+    const style = item.style || 'other';
+    if(!grouped[style]) grouped[style] = [];
+    if(grouped[style].length < 2){
+      const text = replaceCommentPlaceholderNames(String(item.content || '').trim(), chapterNames);
+      if(text) grouped[style].push(text);
+    }
+  });
+
+  const examples = Object.keys(grouped).map(style=>{
+    const label = (QUOTE_STYLES.find(x=>x.key===style)||{label:style}).label;
+    return `【${label}风格语感】${grouped[style].join(' / ')}`;
+  }).filter(Boolean);
+
+  if(!examples.length) return '';
+
+  return `以下仅供学习语气节奏，严禁照搬原句：
+${examples.join('\n')}`;
 }
 
 function buildCommentEmojiPromptText(){
   const stickers = safeArray(state.stickers).slice(0, 20);
-  if(!stickers.length) return '';
 
-  return stickers.map(item=>{
-    return `[表情:${item.name}]`;
-  }).join('、');
+  const kaomojiPool = [
+    '(ﾉ>ω<)ﾉ', '(╥_╥)', '(≧▽≦)', '(｡>﹏<｡)', '╮(╯▽╰)╭',
+    '(っ˘ω˘ς)', '(ノಠ益ಠ)ノ', '(灬ºωº灬)', 'ヽ(✿ﾟ▽ﾟ)ノ', '(´;ω;`)',
+    '٩(๑❛ᴗ❛๑)۶', '(눈_눈)', '(¬_¬)', '(*≧ω≦)', '(°ー°〃)',
+    '┭┮﹏┭┮', 'QAQ', 'TAT', 'OTZ', '233333',
+    'awsl', '呜呜呜', '救命', 'yyds', '绝了',
+    '哈哈哈哈哈', '啊这', '好家伙', '麻了', '笑死'
+  ];
+
+  const parts = [];
+
+  if(stickers.length){
+    const stickerExamples = stickers.slice(0, 12).map(item=>`[表情:${item.name}]`).join('、');
+    parts.push(`可用表情包（插入格式为 [表情:名称]）：${stickerExamples}`);
+  }
+
+  parts.push(`可用颜文字/网络口语（直接写在评论文本中）：${kaomojiPool.slice(0, 15).join('、')}`);
+
+  return parts.join('\n');
 }
 
 function postProcessCommentList(items, contextNames, fallbackName, idPrefix){
@@ -6930,7 +6956,9 @@ function openAiyanDB(){
 
       db.onversionchange = function(){
         try{ db.close(); }catch(e){}
+        __aiyanDbPromise = null;
       };
+
 
       resolve(db);
     };
@@ -6948,32 +6976,53 @@ function openAiyanDB(){
 }
 
 function idbRunTransaction(storeName, mode, runner){
-  return openAiyanDB().then(db=>{
-    return new Promise((resolve, reject)=>{
-      const tx = db.transaction(storeName, mode);
-      const store = tx.objectStore(storeName);
+  function attempt(){
+    return openAiyanDB().then(db=>{
+      return new Promise((resolve, reject)=>{
+        let tx;
+        try{
+          tx = db.transaction(storeName, mode);
+        }catch(e){
+          if(e && e.name === 'InvalidStateError'){
+            __aiyanDbPromise = null;
+            reject(e);
+            return;
+          }
+          reject(e);
+          return;
+        }
+        const store = tx.objectStore(storeName);
 
-      let runnerResult;
+        let runnerResult;
 
-      try{
-        runnerResult = runner(store, tx);
-      }catch(e){
-        reject(e);
-        return;
-      }
+        try{
+          runnerResult = runner(store, tx);
+        }catch(e){
+          reject(e);
+          return;
+        }
 
-      tx.oncomplete = function(){
-        resolve(runnerResult);
-      };
+        tx.oncomplete = function(){
+          resolve(runnerResult);
+        };
 
-      tx.onerror = function(){
-        reject(tx.error || new Error('IndexedDB 事务失败'));
-      };
+        tx.onerror = function(){
+          reject(tx.error || new Error('IndexedDB 事务失败'));
+        };
 
-      tx.onabort = function(){
-        reject(tx.error || new Error('IndexedDB 事务中止'));
-      };
+        tx.onabort = function(){
+          reject(tx.error || new Error('IndexedDB 事务中止'));
+        };
+      });
     });
+  }
+
+  return attempt().catch(function(e){
+    if(e && (e.name === 'InvalidStateError' || (e.message && e.message.includes('connection is closing')))){
+      __aiyanDbPromise = null;
+      return attempt();
+    }
+    throw e;
   });
 }
 
@@ -7402,7 +7451,9 @@ function hasValidSceneStateContent(analysis){
     String(scene.location || '').trim() ||
     safeArray(scene.presentCharacters).length > 0 ||
     safeArray(scene.exitedCharacters).length > 0 ||
+    safeArray(scene.pendingCharacters).length > 0 ||
     String(scene.sceneStatus || '').trim() ||
+    String(scene.emotionTone || '').trim() ||
     String(scene.immediateConflict || '').trim() ||
     String(scene.continuationHint || '').trim()
   );
@@ -7578,20 +7629,36 @@ function applyChapterAnalysisResultPartial(bookId, chapterId, analysis){
     chapter.newCharacters = safeArray(chapter.summaryStructured.newCharacters);
   }
 
-  // 3. 结尾卡：只有有效时才覆盖
-  if(hasValidSceneStateContent(analysis)){
-    chapter.sceneState = Object.assign({
-      location:'',
-      presentCharacters:[],
-      exitedCharacters:[],
-      pendingCharacters:[],
-      sceneStatus:'',
-      emotionTone:'',
-      immediateConflict:'',
-      continuationHint:''
-    }, chapter.sceneState || {}, analysis.sceneState || {});
-  }
+  // 3. 结尾卡：只有当新数据确实有至少一个有效字段时才合并，避免空对象覆盖旧数据
+  if(analysis && analysis.sceneState && typeof analysis.sceneState === 'object'){
+    const incomingScene = analysis.sceneState;
+    const existingScene = chapter.sceneState || {};
 
+    // 检查新数据是否真的有内容
+    const incomingHasContent = !!(
+      String(incomingScene.location || '').trim() ||
+      safeArray(incomingScene.presentCharacters).length ||
+      safeArray(incomingScene.exitedCharacters).length ||
+      String(incomingScene.sceneStatus || '').trim() ||
+      String(incomingScene.immediateConflict || '').trim() ||
+      String(incomingScene.continuationHint || '').trim() ||
+      String(incomingScene.emotionTone || '').trim()
+    );
+
+    if(incomingHasContent){
+      chapter.sceneState = {
+        location: String(incomingScene.location || '').trim() || String(existingScene.location || '').trim() || '',
+        presentCharacters: safeArray(incomingScene.presentCharacters).length ? safeArray(incomingScene.presentCharacters) : safeArray(existingScene.presentCharacters),
+        exitedCharacters: safeArray(incomingScene.exitedCharacters).length ? safeArray(incomingScene.exitedCharacters) : safeArray(existingScene.exitedCharacters),
+        pendingCharacters: safeArray(incomingScene.pendingCharacters).length ? safeArray(incomingScene.pendingCharacters) : safeArray(existingScene.pendingCharacters),
+        sceneStatus: String(incomingScene.sceneStatus || '').trim() || String(existingScene.sceneStatus || '').trim() || '',
+        emotionTone: String(incomingScene.emotionTone || '').trim() || String(existingScene.emotionTone || '').trim() || '',
+        immediateConflict: String(incomingScene.immediateConflict || '').trim() || String(existingScene.immediateConflict || '').trim() || '',
+        continuationHint: String(incomingScene.continuationHint || '').trim() || String(existingScene.continuationHint || '').trim() || ''
+      };
+    }
+    // 如果新数据全空，保留旧数据不覆盖
+  }
   // 4. 一致性报告：只有有效时才覆盖
   if(hasValidConsistencyContent(analysis)){
     chapter.consistencyReport = Object.assign({
@@ -8672,6 +8739,31 @@ async function fetchApiModels(){
   persistAll();
   return models;
 }
+async function testApiConnection(){
+  const preset=getCurrentApiPreset();
+  if(!preset) return {ok:false, message:'当前没有 API 预设'};
+  if(!preset.apiKey) return {ok:false, message:'请先填写 API Key'};
+  if(!preset.apiBaseUrl) return {ok:false, message:'请先填写 Base URL'};
+
+  try{
+    const resp = await callChatJSONWithPreset(preset, [
+      {role:'user', content:'请回复"连接成功"四个字，不要输出其他内容。'}
+    ], {
+      temperature: 0,
+      max_tokens: 50,
+      timeoutMs: 30000
+    });
+
+    const content = String(resp && resp.content || '').trim();
+    if(content){
+      return {ok:true, message:'连接成功！模型返回：' + content.slice(0, 100)};
+    }else{
+      return {ok:false, message:'连接成功但模型返回为空'};
+    }
+  }catch(e){
+    return {ok:false, message:'连接失败：' + (e.message || e)};
+  }
+}
 
 function openModelPicker(){
   const preset=getCurrentApiPreset();
@@ -8841,7 +8933,6 @@ if(plain && isValidModelTextOutput(plain)){
 
 throw new Error('接口返回了非JSON文本，但内容疑似为API元数据，不写入正文。');
 
-    throw new Error('接口返回不是合法JSON，且返回体为空，无法继续解析。');
   }
 
 
@@ -8874,31 +8965,42 @@ throw new Error('接口返回了非JSON文本，但内容疑似为API元数据�
     }
 
     if(typeof value === 'object'){
+      // 不再把 reasoning 类字段混入 flattenAnyText
       const preferredKeys = [
         'content',
         'text',
         'output_text',
-        'reasoning_content',
-        'reasoning',
         'answer',
         'result',
         'response',
         'message'
       ];
 
+      // 明确排除的 reasoning/thinking 字段
+      const excludedKeys = new Set([
+        'reasoning_content',
+        'reasoning',
+        'thinking',
+        'thought',
+        'chain_of_thought',
+        'internal_reasoning'
+      ]);
+
       let collected = '';
 
       preferredKeys.forEach(key=>{
-        if(value[key] != null){
+        if(value[key] != null && !excludedKeys.has(key)){
           collected += flattenAnyText(value[key], currentDepth + 1);
         }
       });
 
       if(collected.trim()) return collected;
 
-      return Object.keys(value).map(key=>{
-        return flattenAnyText(value[key], currentDepth + 1);
-      }).filter(Boolean).join('');
+      return Object.keys(value)
+        .filter(key => !excludedKeys.has(key))
+        .map(key=>{
+          return flattenAnyText(value[key], currentDepth + 1);
+        }).filter(Boolean).join('');
     }
 
     return '';
@@ -8906,38 +9008,60 @@ throw new Error('接口返回了非JSON文本，但内容疑似为API元数据�
 
   function tryExtractContentFromKnownShapes(respData){
     const out = [];
+    const reasoningOut = []; // 单独收集 reasoning，只作最后兜底
 
     const c = (((respData || {}).choices || [])[0] || {});
     const msg = c.message || {};
 
-    if(typeof msg.content === 'string') out.push(msg.content);
+    // 第一优先级：标准 content 字段
+    if(typeof msg.content === 'string' && msg.content.trim()) out.push(msg.content);
     if(Array.isArray(msg.content)) out.push(flattenAnyText(msg.content));
-    if(msg.content && typeof msg.content === 'object') out.push(flattenAnyText(msg.content));
+    if(msg.content && typeof msg.content === 'object' && !Array.isArray(msg.content)) out.push(flattenAnyText(msg.content));
 
-    if(typeof c.text === 'string') out.push(c.text);
-    if(typeof msg.text === 'string') out.push(msg.text);
-    if(typeof msg.output_text === 'string') out.push(msg.output_text);
-    if(typeof msg.reasoning_content === 'string') out.push(msg.reasoning_content);
-    if(typeof msg.reasoning === 'string') out.push(msg.reasoning);
+    // 第二优先级：其他标准正文字段
+    if(typeof c.text === 'string' && c.text.trim()) out.push(c.text);
+    if(typeof msg.text === 'string' && msg.text.trim()) out.push(msg.text);
+    if(typeof msg.output_text === 'string' && msg.output_text.trim()) out.push(msg.output_text);
 
-    if(typeof respData.output_text === 'string') out.push(respData.output_text);
+    // reasoning 字段单独收集，不混入主正文
+    if(typeof msg.reasoning_content === 'string' && msg.reasoning_content.trim()){
+      reasoningOut.push(msg.reasoning_content);
+    }
+    if(typeof msg.reasoning === 'string' && msg.reasoning.trim()){
+      reasoningOut.push(msg.reasoning);
+    }
+
+    // 第三优先级：顶层字段
+    if(typeof respData.output_text === 'string' && respData.output_text.trim()) out.push(respData.output_text);
     if(Array.isArray(respData.output)) out.push(flattenAnyText(respData.output));
-    if(respData.output && typeof respData.output === 'object') out.push(flattenAnyText(respData.output));
+    if(respData.output && typeof respData.output === 'object' && !Array.isArray(respData.output)) out.push(flattenAnyText(respData.output));
 
-    if(typeof respData.response === 'string') out.push(respData.response);
+    if(typeof respData.response === 'string' && respData.response.trim()) out.push(respData.response);
     if(respData.response && typeof respData.response === 'object') out.push(flattenAnyText(respData.response));
 
-    if(typeof respData.result === 'string') out.push(respData.result);
+    if(typeof respData.result === 'string' && respData.result.trim()) out.push(respData.result);
     if(respData.result && typeof respData.result === 'object') out.push(flattenAnyText(respData.result));
 
     if(respData.data && typeof respData.data === 'object'){
       out.push(flattenAnyText(respData.data));
     }
 
-    return out
+    // 过滤并排序：优先取最长的有效内容
+    const filtered = out
       .map(x => String(x || '').trim())
       .filter(Boolean)
       .sort((a,b)=>b.length-a.length);
+
+    // 如果主正文字段全部为空，才用 reasoning 兜底
+    if(!filtered.length && reasoningOut.length){
+      console.warn('【callChatJSON】主正文为空，仅有 reasoning 字段，将 reasoning 作为兜底内容');
+      return reasoningOut
+        .map(x => String(x || '').trim())
+        .filter(Boolean)
+        .sort((a,b)=>b.length-a.length);
+    }
+
+    return filtered;
   }
 
   let contentCandidates = tryExtractContentFromKnownShapes(data);
@@ -10679,6 +10803,104 @@ function parseForumRepliesFromPlainText(rawText, fallbackName){
 
   return dedupeForumReplies(result.filter(isMeaningfulForumReply));
 }
+function repairTruncatedJSON(text){
+  let raw = stripMarkdownCodeFence(String(text || '').trim());
+  if(!raw) return null;
+
+  // 移除尾部不完整的字符串值（如 "location": "客厅里的沙
+  raw = raw.replace(/,\s*"[^"]*":\s*"[^"]*$/g, '');
+  // 移除尾部不完整的数组元素
+  raw = raw.replace(/,\s*"[^"]*$/g, '');
+  raw = raw.replace(/,\s*\[?\s*$/g, '');
+  // 移除尾部悬挂逗号
+  raw = raw.replace(/,\s*$/g, '');
+
+  // 统计未闭合的括号
+  let braceCount = 0;
+  let bracketCount = 0;
+  let inString = false;
+  let escape = false;
+
+  for(let i = 0; i < raw.length; i++){
+    const ch = raw[i];
+
+    if(inString){
+      if(escape){
+        escape = false;
+        continue;
+      }
+      if(ch === '\\'){
+        escape = true;
+        continue;
+      }
+      if(ch === '"'){
+        inString = false;
+      }
+      continue;
+    }
+
+    if(ch === '"'){
+      inString = true;
+      continue;
+    }
+
+    if(ch === '{') braceCount++;
+    else if(ch === '}') braceCount--;
+    else if(ch === '[') bracketCount++;
+    else if(ch === ']') bracketCount--;
+  }
+
+  // 如果还在字符串内部，先强制闭合字符串
+  if(inString){
+    raw += '"';
+  }
+
+  // 先闭合数组，再闭合对象
+  while(bracketCount > 0){
+    raw += ']';
+    bracketCount--;
+  }
+  while(braceCount > 0){
+    raw += '}';
+    braceCount--;
+  }
+
+  // 再清理一次尾部悬挂逗号（闭合前可能产生新的）
+  raw = raw.replace(/,(\s*[}\]])/g, '$1');
+
+  try{
+    JSON.parse(raw);
+    return raw;
+  }catch(e){
+    // 二次尝试：更激进地清理
+    try{
+      let aggressive = raw;
+      // 删掉最后一个不完整的键值对
+      aggressive = aggressive.replace(/,\s*"[^"]*"\s*:\s*(?:"[^"]*"?|[\d.]+|\[[^\]]*\]?|\{[^}]*\}?|null|true|false)?\s*$/g, '');
+      aggressive = aggressive.replace(/,\s*$/g, '');
+
+      let bc = 0, bk = 0, ins = false, esc = false;
+      for(let i = 0; i < aggressive.length; i++){
+        const c = aggressive[i];
+        if(ins){ if(esc){ esc=false; continue; } if(c==='\\'){ esc=true; continue; } if(c==='"') ins=false; continue; }
+        if(c==='"'){ ins=true; continue; }
+        if(c==='{') bc++;
+        else if(c==='}') bc--;
+        else if(c==='[') bk++;
+        else if(c===']') bk--;
+      }
+      if(ins) aggressive += '"';
+      while(bk > 0){ aggressive += ']'; bk--; }
+      while(bc > 0){ aggressive += '}'; bc--; }
+      aggressive = aggressive.replace(/,(\s*[}\]])/g, '$1');
+
+      JSON.parse(aggressive);
+      return aggressive;
+    }catch(e2){
+      return null;
+    }
+  }
+}
 
 function extractJSON(text){
   text = stripMarkdownCodeFence(String(text || '').trim());
@@ -10883,7 +11105,19 @@ function extractForumArrayFromAny(obj, preferredKeys){
 
 function getWorldPrompt(book,selectedWorldIds){
   const ids=safeArray(selectedWorldIds);
-  const items=state.worlds.filter(w=>ids.includes(w.id) && w.enabled!==false);
+
+  // 手动选中的 + triggerMode=always 且 enabled 的自动合并
+  const alwaysWorlds = state.worlds.filter(w =>
+    w.enabled !== false &&
+    w.triggerMode === 'always' &&
+    !ids.includes(w.id)
+  );
+
+  const selectedWorlds = state.worlds.filter(w =>
+    ids.includes(w.id) && w.enabled !== false
+  );
+
+  const items = [].concat(alwaysWorlds, selectedWorlds);
   if(!items.length) return '';
   return items.map(w=>`【${w.title}｜${w.category}】\n${w.content}`).join('\n\n');
 }
@@ -15092,44 +15326,41 @@ const analysis = await analyzeGeneratedChapterWithAI(
 
 let finalAnalysis = analysis;
 
-if(!hasValidAnalysisContent(finalAnalysis)){
-  console.warn('【自动分析结果为空或无有效内容】', { bookId, chapterId, finalAnalysis });
-  toast(
-    '自动分析失败：这次没有拿到有效结果。' + getAnalysisModelSuggestionText(),
-    'error',
-    6000
-  );
-  return;
+{
+  const hasAnySummary = !!String(finalAnalysis.summary || '').trim();
+  const hasAnyTime = !!String(finalAnalysis.timeAnchor || (finalAnalysis.summaryStructured && finalAnalysis.summaryStructured.time) || '').trim();
+  const hasAnyEvents = !!String(finalAnalysis.summaryStructured && finalAnalysis.summaryStructured.events || '').trim();
+  const hasAnyScene = hasValidSceneStateContent(finalAnalysis);
+  const hasAnyConsistency = hasValidConsistencyContent(finalAnalysis);
+
+  if(!hasAnySummary && !hasAnyTime && !hasAnyEvents && !hasAnyScene && !hasAnyConsistency){
+    console.warn('【自动分析结果为空或无有效内容】', { bookId, chapterId, finalAnalysis });
+    toast(
+      '自动分析失败：这次没有拿到有效结果。' + getAnalysisModelSuggestionText(),
+      'error',
+      6000
+    );
+    return;
+  }
+
+  const summaryOk = hasValidSummaryContent(finalAnalysis);
+  const sceneOk = hasValidSceneStateContent(finalAnalysis);
+  const consistencyOk = hasValidConsistencyContent(finalAnalysis);
+
+  if(!summaryOk || !sceneOk || !consistencyOk){
+    console.warn('【自动分析字段不完整，将部分写入可用内容】', {
+      bookId,
+      chapterId,
+      summaryOk,
+      sceneOk,
+      consistencyOk,
+      finalAnalysis
+    });
+  }
 }
 
-const summaryOk = hasValidSummaryContent(finalAnalysis);
-const sceneOk = hasValidSceneStateContent(finalAnalysis);
-const consistencyOk = hasValidConsistencyContent(finalAnalysis);
+    const applied = applyChapterAnalysisResultPartial(bookId, chapterId, finalAnalysis);
 
-if(!summaryOk || !sceneOk || !consistencyOk){
-  console.warn('【自动分析字段不完整】', {
-    bookId,
-    chapterId,
-    summaryOk,
-    sceneOk,
-    consistencyOk,
-    finalAnalysis
-  });
-
-  toast(
-    '自动分析结果不完整：'
-    + `${summaryOk ? '' : '摘要缺失 '}`
-    + `${sceneOk ? '' : '结尾卡缺失 '}`
-    + `${consistencyOk ? '' : '一致性缺失 '}`
-    + '。本次不再自动重试，避免浪费额度。'
-    + getAnalysisModelSuggestionText(),
-    'error',
-    7000
-  );
-  return;
-}
-
-    const applied = applyChapterAnalysisResult(bookId, chapterId, finalAnalysis);
 
     console.log('【自动分析写入后的章节】', applied.chapter);
     console.log('【当前 state.currentChapterId】', state.currentChapterId);
@@ -17982,22 +18213,62 @@ function getChapterGenerationContextConfig(params, book){
   );
 
   const isRegenerate = !!(params && params.isRegenerate);
+  const modelMaxTokens = Number(state.settings.maxTokens || 6000);
+
+  // 根据模型输出能力分档
+  const isSmallModel = modelMaxTokens <= 4000;
+  const isMediumModel = modelMaxTokens > 4000 && modelMaxTokens <= 8000;
 
   let totalBudget = 12000;
 
-  if(requestedWordCount >= 4000){
-    totalBudget = 9000;
-  }else if(requestedWordCount >= 2500){
-    totalBudget = 10500;
-  }
-
-  const modelMaxTokens = Number(state.settings.maxTokens || 6000);
-  if(modelMaxTokens <= 4000){
-    totalBudget = Math.min(totalBudget, 8000);
+  if(isSmallModel){
+    totalBudget = 4500;
+  }else if(isMediumModel){
+    totalBudget = 7500;
+  }else{
+    if(requestedWordCount >= 4000){
+      totalBudget = 9000;
+    }else if(requestedWordCount >= 2500){
+      totalBudget = 10500;
+    }
   }
 
   if(isRegenerate){
-    totalBudget = Math.min(totalBudget, 8000);
+    totalBudget = Math.min(totalBudget, isSmallModel ? 3500 : 8000);
+  }
+
+  if(isSmallModel){
+    return {
+      contextChapters: Math.min(requestedContextChapters, isRegenerate ? 1 : 2),
+      totalBudget,
+      maxPreviousContext: isRegenerate ? 800 : 1200,
+      maxStoryOutline: 400,
+      maxStateCard: isRegenerate ? 600 : 800,
+      maxLongTermMemory: 800,
+      maxLockedCanon: 600,
+      maxNoRepeat: 300,
+      maxWorld: 400,
+      maxChar: 400,
+      maxStylePreset: 200,
+      maxTimeline: 300
+    };
+  }
+
+  if(isMediumModel){
+    return {
+      contextChapters: Math.min(requestedContextChapters, isRegenerate ? 2 : 3),
+      totalBudget,
+      maxPreviousContext: isRegenerate ? 1200 : 1800,
+      maxStoryOutline: isRegenerate ? 500 : 700,
+      maxStateCard: isRegenerate ? 800 : 1000,
+      maxLongTermMemory: isRegenerate ? 1000 : 1600,
+      maxLockedCanon: isRegenerate ? 800 : 1200,
+      maxNoRepeat: isRegenerate ? 500 : 700,
+      maxWorld: isRegenerate ? 600 : 800,
+      maxChar: isRegenerate ? 600 : 800,
+      maxStylePreset: 300,
+      maxTimeline: isRegenerate ? 400 : 600
+    };
   }
 
   return {
@@ -18058,10 +18329,29 @@ async function generateFirstChapterWithAI(params){
 
   if(!book) throw new Error('书籍不存在');
 
+  const allWorldText = getWorldPrompt(book, params.activeWorldIds);
+
+  const jailbreakWorlds = state.worlds.filter(w =>
+    safeArray(params.activeWorldIds).includes(w.id) &&
+    w.enabled !== false &&
+    w.category === 'jailbreak'
+  );
+  const nonJailbreakWorlds = state.worlds.filter(w =>
+    safeArray(params.activeWorldIds).includes(w.id) &&
+    w.enabled !== false &&
+    w.category !== 'jailbreak'
+  );
+
+  const jailbreakText = jailbreakWorlds.length
+    ? jailbreakWorlds.map(w => w.content).join('\n\n')
+    : '';
   const worldText = safeLimitText(
-    getWorldPrompt(book, params.activeWorldIds),
+    nonJailbreakWorlds.length
+      ? nonJailbreakWorlds.map(w => `【${w.title}｜${w.category}】\n${w.content}`).join('\n\n')
+      : '',
     1400
   );
+
 
   const charText = safeLimitText(
     getCharacterPrompt(params.activeCharacterIds),
@@ -18115,7 +18405,7 @@ async function generateFirstChapterWithAI(params){
 立意：${book.theme}
 大致走向：${book.defaultSettings.direction || ''}
 
-【锁定设定｜如果有，必须遵守】
+${jailbreakText ? `【核心规则｜最高优先级｜必须无条件遵守】\n${jailbreakText}\n\n` : ''}【锁定设定｜如果有，必须遵守】
 ${lockedCanonPrompt || '无'}
 
 【角色设定】
@@ -18167,7 +18457,10 @@ ${params.guide || '无'}
       ],
       {
         temperature: Number(state.settings.creativeTemperature ?? 0.72),
-        max_tokens: Math.min(Number(state.settings.maxTokens || 6000), 12000)
+        max_tokens: Math.min(
+          Number(state.settings.maxTokens || 6000),
+          safeWordCount <= 2000 ? 4000 : 8000
+        )
       }
     );
 
@@ -18253,7 +18546,7 @@ if(fallbackRaw.length > 80){
         ],
         {
           temperature: 0.75,
-          max_tokens: 6000
+          max_tokens: Math.min(Number(state.settings.maxTokens || 6000), 6000)
         }
       );
 
@@ -18309,6 +18602,26 @@ async function generateChapterWithAI(params){
   const contextConfig = getChapterGenerationContextConfig(params, book);
 
   const worldTextRaw = getWorldPrompt(sourceBook, params.activeWorldIds);
+
+  // 拆分：jailbreak类世界书独立注入，优先级最高
+  const jailbreakWorlds = state.worlds.filter(w =>
+    safeArray(params.activeWorldIds).includes(w.id) &&
+    w.enabled !== false &&
+    w.category === 'jailbreak'
+  );
+  const nonJailbreakWorlds = state.worlds.filter(w =>
+    safeArray(params.activeWorldIds).includes(w.id) &&
+    w.enabled !== false &&
+    w.category !== 'jailbreak'
+  );
+
+  const jailbreakTextRaw = jailbreakWorlds.length
+    ? jailbreakWorlds.map(w => w.content).join('\n\n')
+    : '';
+  const worldTextNonJailbreak = nonJailbreakWorlds.length
+    ? nonJailbreakWorlds.map(w => `【${w.title}｜${w.category}】\n${w.content}`).join('\n\n')
+    : '';
+
   const charTextRaw = getCharacterPrompt(params.activeCharacterIds);
   const stylePresetTextRaw = getStylePrompt(params.activeStyleIds);
 
@@ -18460,14 +18773,14 @@ console.log('【语义召回结果】', semanticRecallPromptRaw);
 {
   key:'hardFacts',
   priority:'high',
-  minLen:400,
-  content: safeLimitText(hardFactsPromptRaw, params && params.isRegenerate ? 1200 : 2200)
+  minLen: contextConfig.totalBudget <= 5000 ? 150 : 400,
+  content: safeLimitText(hardFactsPromptRaw, contextConfig.totalBudget <= 5000 ? 700 : (params && params.isRegenerate ? 1200 : 2200))
 },
 {
   key:'compactMemory',
-  priority:'high',
-  minLen:300,
-  content: safeLimitText(compactMemoryPromptRaw, params && params.isRegenerate ? 1200 : 2200)
+  priority: contextConfig.totalBudget <= 5000 ? 'medium' : 'high',
+  minLen: contextConfig.totalBudget <= 5000 ? 100 : 300,
+  content: safeLimitText(compactMemoryPromptRaw, contextConfig.totalBudget <= 5000 ? 600 : (params && params.isRegenerate ? 1200 : 2200))
 },
 {
   key:'characterFactCard',
@@ -18510,9 +18823,9 @@ console.log('【语义召回结果】', semanticRecallPromptRaw);
     },
     {
       key:'semanticRecall',
-      priority:'medium',
-      minLen:200,
-      content: safeLimitText(semanticRecallPromptRaw, params && params.isRegenerate ? 900 : 1600)
+      priority: contextConfig.totalBudget <= 5000 ? 'low' : 'medium',
+      minLen: contextConfig.totalBudget <= 5000 ? 0 : 200,
+      content: safeLimitText(semanticRecallPromptRaw, contextConfig.totalBudget <= 5000 ? 400 : (params && params.isRegenerate ? 900 : 1600))
     },
     {
       key:'timeline',
@@ -18555,7 +18868,13 @@ console.log('【语义召回结果】', semanticRecallPromptRaw);
       key:'worldText',
       priority:'medium',
       minLen:120,
-      content: safeLimitText(worldTextRaw, contextConfig.maxWorld)
+      content: safeLimitText(worldTextNonJailbreak, contextConfig.maxWorld)
+    },
+    {
+      key:'jailbreakText',
+      priority:'high',
+      minLen:200,
+      content: safeLimitText(jailbreakTextRaw, 2000)
     },
     {
       key:'charText',
@@ -18572,7 +18891,7 @@ console.log('【语义召回结果】', semanticRecallPromptRaw);
     {
       key:'storyOutline',
       priority:'low',
-      minLen:200,
+      minLen: contextConfig.totalBudget <= 5000 ? 0 : 200,
       content: safeLimitText(storyOutlineRaw, contextConfig.maxStoryOutline)
     },
     {
@@ -18600,6 +18919,8 @@ console.log('【语义召回结果】', semanticRecallPromptRaw);
   });
 
   const worldText = blockMap.worldText || '';
+  const jailbreakPrompt = blockMap.jailbreakText || '';
+
   const charText = blockMap.charText || '';
   const stylePresetText = blockMap.stylePreset || '';
   const previousContext = blockMap.previousContext || '';
@@ -18709,6 +19030,8 @@ compactMemoryPrompt: compactMemoryPrompt.length,
 文案：${book.intro}
 立意：${book.theme}
 大致走向：${book.defaultSettings.direction || ''}
+${jailbreakPrompt ? `${jailbreakPrompt}\n\n` : ''}【锁定设定｜最高优先级】
+${lockedCanonPrompt || '暂无锁定设定'}
 
 【锁定设定｜最高优先级】
 ${lockedCanonPrompt || '暂无锁定设定'}
@@ -18859,6 +19182,8 @@ ${resolvedRecentEventsPrompt || '暂无已完成事件。'}
 文案：${book.intro}
 立意：${book.theme}
 大致走向：${book.defaultSettings.direction || ''}
+${jailbreakPrompt ? `${jailbreakPrompt}\n\n` : ''}【锁定设定｜最高优先级】
+${lockedCanonPrompt || '暂无锁定设定'}
 
 【锁定设定｜最高优先级】
 ${lockedCanonPrompt || '暂无锁定设定'}
@@ -19007,7 +19332,12 @@ ${resolvedRecentEventsPrompt || '暂无已完成事件。'}
         ],
         {
           temperature: Number(state.settings.creativeTemperature ?? 0.72),
-          max_tokens: Math.min(Number(state.settings.maxTokens || 6000), 20000),
+          max_tokens: Math.min(
+            Number(state.settings.maxTokens || 6000),
+            safeWordCount <= 2000 ? 4000 :
+            safeWordCount <= 4000 ? 8000 :
+            16000
+          ),
           abortRef: state.streamingAbort || null
         },
         (piece, fullText)=>{
@@ -19027,10 +19357,12 @@ ${resolvedRecentEventsPrompt || '暂无已完成事件。'}
           { role: 'user', content: userPrompt }
         ],
         {
-            temperature: Number(state.settings.creativeTemperature ?? 0.72),
+          temperature: Number(state.settings.creativeTemperature ?? 0.72),
           max_tokens: Math.min(
             Number(state.settings.maxTokens || 6000),
-            20000
+            safeWordCount <= 2000 ? 4000 :
+            safeWordCount <= 4000 ? 8000 :
+            16000
           )
         }
       );
@@ -21721,9 +22053,14 @@ async function generateSimpleFallbackCommentsWithAI(book, chapter){
   ]
 }
 5. endComments 生成 4~8 条，bookComments 生成 3~6 条
-6. 评论语气自然，允许有轻微重复风格，但不要完全一样
-7. 不要输出“以下是评论”“文末评论如下”之类说明句
-8. 不要剧透超出本章之外的内容
+6. 每条评论必须针对本章正文中的具体事件、人物、对话或场景做出反应
+7. 不同评论之间句式结构必须有明显差异，禁止多条评论套用同一个句式模板
+8. 评论要像"读完某一段后的即时反应"，至少一半评论需要提及正文中的具体细节
+9. 允许有发疯、吐槽、磕CP等多种风格，但内容必须来自本章
+10. 不要输出"以下是评论""文末评论如下"之类说明句
+11. 不要剧透超出本章之外的内容
+12. 全部评论中至少 2~3 条要带颜文字或网络口语语气词，例如：(≧▽≦)、QAQ、awsl、救命、笑死、哈哈哈哈哈、233333、┭┮﹏┭┮ 等
+13. 如果有表情包库，也可以用 [表情:名称] 格式插入，大约 30% 的评论带即可
 
 书名：${book.title || ''}
 章节标题：${chapterTitle}
@@ -21863,10 +22200,32 @@ async function generateChapterCommentsWithAI(book, chapter){
 
   const recentContext = buildRecentChapterContext(book, chapter, 2) || '';
   const relationshipSummary = buildRelationshipSummaryForComments(book, chapter) || '';
-  const shortParagraphs = safeArray(paragraphs)
-    .filter(item => String(item.text || '').trim())
-    .slice(0, 4)
-    .map(item => `段落${item.index}：${String(item.text || '').slice(0, 120)}`)
+  const filteredParagraphs = safeArray(paragraphs).filter(item => String(item.text || '').trim());
+  const totalParaCount = filteredParagraphs.length;
+
+  // 从全文中均匀采样最多12段，确保前中后都有代表
+  const sampleCount = Math.min(12, totalParaCount);
+  const sampledParagraphs = [];
+
+  if(totalParaCount <= sampleCount){
+    sampledParagraphs.push(...filteredParagraphs);
+  }else{
+    const step = totalParaCount / sampleCount;
+    for(let i = 0; i < sampleCount; i++){
+      const idx = Math.min(Math.floor(i * step), totalParaCount - 1);
+      if(!sampledParagraphs.includes(filteredParagraphs[idx])){
+        sampledParagraphs.push(filteredParagraphs[idx]);
+      }
+    }
+    // 确保最后一段一定在采样中
+    const lastPara = filteredParagraphs[totalParaCount - 1];
+    if(!sampledParagraphs.includes(lastPara)){
+      sampledParagraphs.push(lastPara);
+    }
+  }
+
+  const shortParagraphs = sampledParagraphs
+    .map(item => `段落${item.index}：${String(item.text || '').slice(0, 100)}`)
     .join('\n');
 
   const quotePromptText = buildCommentQuotePromptText(book, chapter) || '';
@@ -21898,9 +22257,10 @@ async function generateChapterCommentsWithAI(book, chapter){
 }
 
 生成要求：
-- paragraphComments：0~5组，只有在你能明确对应段落时才生成
+- paragraphComments：0~6组，必须分散在全文不同位置（前段、中段、后段都要有），不要只集中在前几段
 - endComments：4~8条
 - bookComments：3~6条
+- 本章共有 ${totalParaCount} 个段落，段评的 paragraphIndex 必须从 1 到 ${totalParaCount} 之间选取，尽量覆盖前中后
 - 评论要自然、口语化、像真实读者
 - 可以有情绪、玩梗、夸张，但不要太模板化
 - 不要输出说明句，如“以下是评论”
@@ -21916,14 +22276,31 @@ ${recentContext || '无'}
 关系与人物摘要：
 ${relationshipSummary || '无'}
 
-章节段落预览：
+章节段落预览（共${totalParaCount}段，以下为均匀采样）：
 ${shortParagraphs || '无'}
 
-可参考语气素材：
-${quotePromptText || '无'}
+注意：段评不要只评论采样中出现的段落，你可以根据正文全文自由选择任意段落号（1~${totalParaCount}）进行段评，前提是该段确实有值得评论的内容。
 
-可参考表情风格：
+${quotePromptText || ''}
+
+【表情包与颜文字使用要求｜必须遵守】
 ${emojiPromptText || '无'}
+
+使用规则：
+1. 全部评论中，至少 2~4 条必须包含表情包或颜文字或网络口语语气词
+2. 表情包用 [表情:名称] 格式插入，颜文字和网络口语直接写在文本中
+3. 不要每条都加，大约 30%~50% 的评论带即可
+4. 表情包/颜文字必须贴合评论情绪，不要乱加
+5. 允许混用，例如："这段太绝了[表情:磕到了] (≧▽≦) 我先磕为敬"
+6. 段评中也可以带表情包或颜文字，不只是文末评论才能用
+
+
+【评论原创性铁律】
+1. 每条评论必须针对本章正文中的具体事件、对话、人物行为做出反应
+2. 禁止输出任何与语录库原文相同或高度相似的句子
+3. 不同评论之间的句式结构必须有明显差异，禁止套用同一个模板
+4. 评论要像"刚读完这一段的即时反应"，不要像"从素材库里挑了一句贴上去"
+5. 至少一半评论必须提及本章正文中的具体细节（人名、事件、对话、场景）
 
 章节正文：
 ${chapterText.slice(0, 9000)}
@@ -22263,6 +22640,17 @@ const draftReferenceText = safeArray(chapter && chapter.drafts).length
 
 {
   "summary": "",
+  "timeAnchor": "",
+  "sceneState": {
+    "location": "",
+    "presentCharacters": [],
+    "exitedCharacters": [],
+    "pendingCharacters": [],
+    "sceneStatus": "",
+    "emotionTone": "",
+    "immediateConflict": "",
+    "continuationHint": ""
+  },
   "summaryStructured": {
     "time": "",
     "characters": [],
@@ -22286,17 +22674,6 @@ const draftReferenceText = safeArray(chapter && chapter.drafts).length
       }
     ]
   },
-  "sceneState": {
-    "location": "",
-    "presentCharacters": [],
-    "exitedCharacters": [],
-    "pendingCharacters": [],
-    "sceneStatus": "",
-    "emotionTone": "",
-    "immediateConflict": "",
-    "continuationHint": ""
-  },
-  "timeAnchor": "",
   "consistencyReport": {
     "score": 0,
     "hasConflict": false,
@@ -22313,19 +22690,23 @@ const draftReferenceText = safeArray(chapter && chapter.drafts).length
 
 【统一输出要求】
 1. 这次是一次性统一分析：摘要、sceneState、一致性评分必须共用同一次API调用
-2. summary 用 100~220 字，概括本章最关键的剧情推进
-3. summaryStructured.time：明确时间节点
-4. summaryStructured.characters：列核心出场人物
-5. summaryStructured.relationships：概括人物关系变化或状态
-6. summaryStructured.events：概括关键事件
-7. summaryStructured.foreshadowing：写新增伏笔、异常细节、未解决问题，没有就写“无明显新增”
-8. summaryStructured.psychology：概括主视角人物心理变化
-9. summaryStructured.ages：若正文中明确出现年龄，或时间跳转足以推导年龄变化，请记录
-10. summaryStructured.newCharacters：若有首次登场角色，必须记录
-11. sceneState 必须填写“本章结尾承接状态”
-12. timeAnchor 尽量简短明确
-13. consistencyReport 需要给出一致性评分与问题列表
-14. 不要输出 detailExtract，不要尝试自动提取细节池条目
+2. summary 用 60~150 字即可，概括本章最关键的剧情推进
+3. timeAnchor 和 sceneState 必须优先填写，绝对不允许留空
+4. sceneState 的 location、presentCharacters、exitedCharacters、immediateConflict 四个字段是必填项
+5. 即使正文没有明确说明地点或在场人物，也必须根据正文内容合理推导填写
+6. summaryStructured.time：明确时间节点
+7. summaryStructured.characters：列核心出场人物
+8. summaryStructured.relationships：概括人物关系变化或状态
+9. summaryStructured.events：概括关键事件
+10. summaryStructured.foreshadowing：写新增伏笔、异常细节、未解决问题，没有就写"无明显新增"
+11. summaryStructured.psychology：概括主视角人物心理变化
+12. summaryStructured.ages：若正文中明确出现年龄，或时间跳转足以推导年龄变化，请记录
+13. summaryStructured.newCharacters：若有首次登场角色，必须记录
+14. sceneState 必须填写"本章结尾承接状态"，这是下一章续写的关键依据
+15. timeAnchor 尽量简短明确
+16. consistencyReport 需要给出一致性评分与问题列表
+17. 不要输出 detailExtract，不要尝试自动提取细节池条目
+18. 如果输出长度不够，优先保证 summary + timeAnchor + sceneState 完整，consistencyReport 可以精简
 
 【时间提取规则】
 1. 如果正文出现明确日期，直接使用正文日期
@@ -22376,30 +22757,24 @@ K. 一致性判断时，上一章只能指当前章节 index 之前的正式章�
 - suggestion 写一句简短结论
 
 【锁定设定】
-${lockedCanonPrompt || '无'}
+${safeLimitText(lockedCanonPrompt || '无', 800)}
 
-${timeStylePrompt}
+${hardFactsPrompt ? safeLimitText(hardFactsPrompt, 800) : ''}
 
-${hardFactsPrompt ? `\n${hardFactsPrompt}\n` : ''}
+${characterFactCardPrompt ? safeLimitText(characterFactCardPrompt, 800) : ''}
 
-${characterFactCardPrompt ? `\n${characterFactCardPrompt}\n` : ''}
+${book.isDerivative && branchPremisePrompt ? `【支线前提包】\n${safeLimitText(branchPremisePrompt, 800)}` : ''}
 
-
-【支线前提包｜如果这是派生书，优先以此为一致性承接基线】
-
-${branchPremisePrompt || '无'}
-
-【派生继承快照｜如果这是派生书，优先以此为一致性承接基线】
-${inheritedSnapshotPrompt || '无'}
+${book.isDerivative && inheritedSnapshotPrompt ? `【派生继承快照】\n${safeLimitText(inheritedSnapshotPrompt, 600)}` : ''}
 
 【长期记忆】
-${longTermMemoryPrompt || '无'}
+${safeLimitText(longTermMemoryPrompt || '无', 1200)}
 
-【全人物关系网】
-${relationshipNetworkPrompt || '无'}
+【锁定关系】
+${safeLimitText(relationshipNetworkPrompt || '无', 600)}
 
-【当前动态细节池（只用于一致性参考，不要生成新细节）】
-${detailMemoryPrompt || '无'}
+【动态细节池（只用于一致性参考）】
+${safeLimitText(detailMemoryPrompt || '无', 600)}
 
 【最近前文】
 ${previousContext}
@@ -22416,11 +22791,21 @@ ${currentOpeningText}
 【当前章节】
 标题：第${chapter.index}章《${chapter.title}》
 正文：
-${safeLimitText(chapter.content, 18000)}
+${safeLimitText(chapter.content, 8000)}
 
 只输出 JSON。`;
 
-const resp = await callChatWithAutoStreamFallbackWithPreset(
+const analysisMaxTokens = Math.max(
+  6000,
+  Math.min(Number(state.settings.maxTokens || 8000), 10000)
+);
+
+let resp;
+let obj = null;
+let analysisTruncated = false;
+
+// 第一次请求
+resp = await callChatWithAutoStreamFallbackWithPreset(
   preset,
   [
     {role:'system', content:sys},
@@ -22428,12 +22813,198 @@ const resp = await callChatWithAutoStreamFallbackWithPreset(
   ],
   {
     temperature: 0.2,
-    max_tokens: 3200,
-    timeoutMs: 240000
+    max_tokens: analysisMaxTokens,
+    timeoutMs: 300000
   }
 );
 
-  const obj = extractJSON(resp.content);
+const rawAnalysisContent = String(resp.content || '').trim();
+console.log('【分析原始返回长度】', rawAnalysisContent.length);
+console.log('【分析finish_reason】', resp.finishReason);
+// 检测是否返回了纯 reasoning/thinking 内容而非JSON
+if(rawAnalysisContent && !rawAnalysisContent.includes('{') && !rawAnalysisContent.includes('[')){
+  const looksLikeReasoning =
+    /^(I'm now|I will|Let me|I need to|First,|Now I|Looking at|Analyzing|The chapter|This chapter)/i.test(rawAnalysisContent) ||
+    /^(好的|我来|先分析|让我|首先|接下来|这一章|本章)/i.test(rawAnalysisContent);
+
+  if(looksLikeReasoning){
+    console.warn('【分析返回疑似为模型思维链/reasoning，而非JSON结果】', rawAnalysisContent.slice(0, 300));
+    console.warn('【可能原因】当前模型返回了 reasoning_content 而非 content，或模型未按要求输出JSON');
+
+    // 直接跳过第一次解析，强制进入精简重试
+    analysisTruncated = true;
+  }
+}
+
+if(String(resp.finishReason || '').toLowerCase() === 'length'){
+  analysisTruncated = true;
+  console.warn('【分析结果被截断】finish_reason=length，尝试修复截断JSON');
+}
+
+// 尝试解析（含截断修复）
+try{
+  obj = extractJSON(rawAnalysisContent);
+}catch(parseErr1){
+  console.warn('【分析JSON解析失败，尝试截断修复】', parseErr1);
+
+  // 截断修复：尝试补齐未闭合的括号
+  const repaired = repairTruncatedJSON(rawAnalysisContent);
+  if(repaired){
+    try{
+      obj = extractJSON(repaired);
+      console.log('【截断JSON修复成功】');
+    }catch(parseErr2){
+      console.warn('【截断JSON修复后仍解析失败】', parseErr2);
+    }
+  }
+}
+
+// 如果仍然失败且是截断导致的，尝试精简重试
+if(!obj && analysisTruncated){
+  console.warn('【截断导致解析失败，尝试精简重试】');
+
+const retrySys = `你是中文小说章节分析助手。
+你的输出必须是纯JSON，不能包含任何其他内容。
+禁止输出思考过程、分析过程、英文推理、markdown代码块。
+第一个字符必须是 { 或 [。`;
+  const retryUser = `请分析以下章节，只输出JSON：
+{
+  "summary": "",
+  "timeAnchor": "",
+  "sceneState": {
+    "location": "",
+    "presentCharacters": [],
+    "exitedCharacters": [],
+    "pendingCharacters": [],
+    "sceneStatus": "",
+    "emotionTone": "",
+    "immediateConflict": "",
+    "continuationHint": ""
+  },
+  "summaryStructured": {
+    "time": "",
+    "characters": [],
+    "relationships": "",
+    "events": "",
+    "foreshadowing": "",
+    "psychology": "",
+    "ages": [],
+    "newCharacters": []
+  },
+  "consistencyReport": {
+    "score": 0,
+    "hasConflict": false,
+    "issues": [],
+    "suggestion": ""
+  }
+}
+
+要求：
+1. summary 60~120字
+2. sceneState 必须填写 location、presentCharacters、exitedCharacters、immediateConflict
+3. consistencyReport.score 给0~100分
+4. 只输出JSON，不要解释，不要代码块
+
+章节标题：第${chapter.index}章《${chapter.title}》
+时间线参考：${getDisplayTimeAnchor(chapter) || '未明确'}
+${immediatePrev ? `上一章结尾在场：${safeArray(immediatePrev.sceneState && immediatePrev.sceneState.presentCharacters).join('、') || '未记录'}\n上一章已退场：${safeArray(immediatePrev.sceneState && immediatePrev.sceneState.exitedCharacters).join('、') || '无'}` : ''}
+
+正文：
+${safeLimitText(chapter.content, 6000)}`;
+
+  try{
+    const retryResp = await callChatWithAutoStreamFallbackWithPreset(
+      preset,
+      [
+        {role:'system', content:retrySys},
+        {role:'user', content:retryUser}
+      ],
+      {
+        temperature: 0.15,
+        max_tokens: Math.min(analysisMaxTokens, 3000),
+        timeoutMs: 180000
+      }
+    );
+
+    const retryRaw = String(retryResp.content || '').trim();
+    console.log('【精简重试返回长度】', retryRaw.length);
+    console.log('【精简重试返回前500字】', retryRaw.slice(0, 500));
+
+    try{
+      obj = extractJSON(retryRaw);
+    }catch(retryParseErr){
+      console.warn('【精简重试JSON解析失败，尝试截断修复】', retryParseErr);
+      const retryRepaired = repairTruncatedJSON(retryRaw);
+      if(retryRepaired){
+        try{
+          obj = extractJSON(retryRepaired);
+          console.log('【精简重试截断修复成功】');
+        }catch(e){
+          console.warn('【精简重试截断修复后仍失败】', e);
+        }
+      }
+    }
+  }catch(retryErr){
+    console.error('【精简重试请求也失败】', retryErr);
+  }
+}
+
+// 如果JSON仍然失败，尝试从原始返回中提取部分有用信息
+if(!obj && rawAnalysisContent){
+  console.warn('【JSON完全解析失败，尝试从纯文本抢救部分字段】');
+
+  // 尝试至少抢救 summary
+  const summaryMatch = rawAnalysisContent.match(/"summary"\s*:\s*"([^"]{10,300})"/);
+  const timeMatch = rawAnalysisContent.match(/"timeAnchor"\s*:\s*"([^"]{2,100})"/);
+  const locationMatch = rawAnalysisContent.match(/"location"\s*:\s*"([^"]{2,60})"/);
+  const eventsMatch = rawAnalysisContent.match(/"events"\s*:\s*"([^"]{10,300})"/);
+
+  if(summaryMatch || eventsMatch){
+    obj = {
+      summary: summaryMatch ? summaryMatch[1] : '',
+      timeAnchor: timeMatch ? timeMatch[1] : '',
+      summaryStructured: {
+        time: timeMatch ? timeMatch[1] : '',
+        characters: [],
+        relationships: '',
+        events: eventsMatch ? eventsMatch[1] : '',
+        foreshadowing: '',
+        psychology: '',
+        ages: [],
+        newCharacters: []
+      },
+      sceneState: {
+        location: locationMatch ? locationMatch[1] : '',
+        presentCharacters: [],
+        exitedCharacters: [],
+        pendingCharacters: [],
+        sceneStatus: '',
+        emotionTone: '',
+        immediateConflict: '',
+        continuationHint: ''
+      },
+      consistencyReport: {
+        score: null,
+        hasConflict: false,
+        issues: [],
+        suggestion: '分析返回不完整，部分字段通过正则抢救'
+      }
+    };
+    console.log('【纯文本正则抢救成功，拿到部分字段】');
+  }
+}
+
+if(!obj){
+  throw new Error(
+    '章节分析失败：模型返回不是有效JSON，即使重试和修复后仍无法解析。\n\n' +
+    '建议：\n' +
+    '1. 在"设置"页将"模型最大输出Token"调大到 8000 以上\n' +
+    '2. 更换更稳定的分析模型（如 gpt-4o-mini、deepseek-chat）\n' +
+    '3. 减少章节正文长度后重试\n' +
+    '4. 检查辅API预设是否配置正确\n\n' +
+    '原始返回片段：' + String(rawAnalysisContent || '').slice(0, 300)
+  );
+}
 
   const normalizedChapter = normalizeChapterResult({
     title: chapter.title,
@@ -22662,7 +23233,7 @@ ${timeStylePrompt}
 
 章节标题：第${chapter.index}章《${chapter.title}》
 正文：
-${safeLimitText(chapter.content, 16000)}
+${safeLimitText(chapter.content, 10000)}
 `;
 
   const resp = await callChatWithAutoStreamFallbackWithPreset(
@@ -22673,13 +23244,30 @@ ${safeLimitText(chapter.content, 16000)}
     ],
     {
       temperature: Number(state.settings.analysisTemperature ?? 0.2),
-      max_tokens: 1800,
+      max_tokens: 3000,
       timeoutMs: 180000
     }
   );
 
-  const obj = extractJSON(resp.content);
+  const rawSummaryContent = String(resp.content || '').trim();
+  let obj = null;
 
+  try{
+    obj = extractJSON(rawSummaryContent);
+  }catch(parseErr){
+    console.warn('【摘要JSON解析失败，尝试截断修复】', parseErr);
+    const repaired = repairTruncatedJSON(rawSummaryContent);
+    if(repaired){
+      try{
+        obj = extractJSON(repaired);
+        console.log('【摘要截断JSON修复成功】');
+      }catch(e){
+        throw new Error('摘要生成返回不是有效JSON，截断修复后仍失败');
+      }
+    }else{
+      throw parseErr;
+    }
+  }
   const summaryStructured = Object.assign({
     time:'',
     characters:[],
@@ -22743,44 +23331,40 @@ const analysis = await analyzeGeneratedChapterWithAI(
   latestPairBefore.chapter
 );
 
-if(!hasValidAnalysisContent(analysis)){
-  console.warn('【重新分析结果为空或无有效内容】', { bookId, chapterId, analysis });
-  toast(
-    '重新分析失败：这次没有拿到有效结果。' + getAnalysisModelSuggestionText(),
-    'error',
-    5000
-  );
-  return;
+{
+  const hasAnySummary = !!String(analysis.summary || '').trim();
+  const hasAnyTime = !!String(analysis.timeAnchor || (analysis.summaryStructured && analysis.summaryStructured.time) || '').trim();
+  const hasAnyEvents = !!String(analysis.summaryStructured && analysis.summaryStructured.events || '').trim();
+  const hasAnyScene = hasValidSceneStateContent(analysis);
+  const hasAnyConsistency = hasValidConsistencyContent(analysis);
+
+  if(!hasAnySummary && !hasAnyTime && !hasAnyEvents && !hasAnyScene && !hasAnyConsistency){
+    console.warn('【重新分析结果为空或无有效内容】', { bookId, chapterId, analysis });
+    toast(
+      '重新分析失败：这次没有拿到有效结果。' + getAnalysisModelSuggestionText(),
+      'error',
+      5000
+    );
+    return;
+  }
+
+  const summaryOk = hasValidSummaryContent(analysis);
+  const sceneOk = hasValidSceneStateContent(analysis);
+  const consistencyOk = hasValidConsistencyContent(analysis);
+
+  if(!summaryOk || !sceneOk || !consistencyOk){
+    console.warn('【重新分析结果字段不完整，将部分写入可用内容】', {
+      bookId,
+      chapterId,
+      summaryOk,
+      sceneOk,
+      consistencyOk,
+      analysis
+    });
+  }
 }
 
-const summaryOk = hasValidSummaryContent(analysis);
-const sceneOk = hasValidSceneStateContent(analysis);
-const consistencyOk = hasValidConsistencyContent(analysis);
-
-if(!summaryOk || !sceneOk || !consistencyOk){
-  console.warn('【重新分析结果字段不完整】', {
-    bookId,
-    chapterId,
-    summaryOk,
-    sceneOk,
-    consistencyOk,
-    analysis
-  });
-
-  toast(
-    '重新分析结果不完整：'
-    + `${summaryOk ? '' : '摘要缺失 '}`
-    + `${sceneOk ? '' : '结尾卡缺失 '}`
-    + `${consistencyOk ? '' : '一致性缺失 '}`
-    + '。本次不自动重试，避免浪费额度。'
-    + getAnalysisModelSuggestionText(),
-    'error',
-    6500
-  );
-  return;
-}
-
-      const applied = applyChapterAnalysisResult(bookId, chapterId, analysis);
+      const applied = applyChapterAnalysisResultPartial(bookId, chapterId, analysis);
       const report = applied.chapter.consistencyReport || {
         checkedAt: Date.now(),
         score:null,
@@ -22971,13 +23555,22 @@ const analysis = await analyzeGeneratedChapterWithAI(
 let finalAnalysis = analysis;
 
 if(!hasValidAnalysisContent(finalAnalysis)){
-  console.warn('【补摘要结果为空或无有效内容】', { bookId, chapterId, finalAnalysis });
-  toast(
-    '这次分析失败，没有拿到有效结果。' + getAnalysisModelSuggestionText(),
-    'error',
-    5000
-  );
-  return;
+  // 放宽判断：只要 summary 或 timeAnchor 或 events 有任何一项非空，就尝试部分写入
+  const hasAnySummary = !!String(finalAnalysis.summary || '').trim();
+  const hasAnyTime = !!String(finalAnalysis.timeAnchor || (finalAnalysis.summaryStructured && finalAnalysis.summaryStructured.time) || '').trim();
+  const hasAnyEvents = !!String(finalAnalysis.summaryStructured && finalAnalysis.summaryStructured.events || '').trim();
+
+  if(!hasAnySummary && !hasAnyTime && !hasAnyEvents){
+    console.warn('【补摘要结果为空或无有效内容】', { bookId, chapterId, finalAnalysis });
+    toast(
+      '这次分析失败，没有拿到有效结果。' + getAnalysisModelSuggestionText(),
+      'error',
+      5000
+    );
+    return;
+  }
+
+  console.warn('【补摘要结果不完整但有部分可用内容，继续部分写入】', { bookId, chapterId, finalAnalysis });
 }
 
 const summaryOk = hasValidSummaryContent(finalAnalysis);
@@ -23204,18 +23797,27 @@ function buildQuotePromptForAI(maxPerStyle){
 
   const examples = Object.keys(grouped).map(style=>{
     const label = (QUOTE_STYLES.find(x=>x.key===style)||{label:style}).label;
-    return `【${label}】\n` + grouped[style]
-      .slice(0, maxPerStyle || 4)
-      .map(item=>`- ${item.content}`)
-      .join('\n');
-  }).join('\n\n');
+    return `【${label}风格语感示例】` + grouped[style]
+      .slice(0, maxPerStyle || 2)
+      .map(item=>`"${item.content}"`)
+      .join('、');
+  }).join('\n');
 
-  return `以下语录库只用于学习“语气、节奏、社区说话方式”，严禁整句照搬，严禁只替换一两个词后复用原句。
-如果语录中出现“xxx、某人、A、B、主角、角色等占位写法”，你必须结合当前剧情上下文改写成自然表达：
-1. 优先替换成当前章节真实角色名或明确称呼
-2. 如果上下文不适合点名，就改成自然省略说法
-3. 绝对不能原样输出“xxx”“某人”“A”“B”这类占位符
-4. 评论必须像读者即时反应，不要像在引用素材库原文
+  return `【语录库使用铁律｜最重要｜违反即为失败】
+以下语录仅用于学习"语气类型、情绪浓度、说话节奏"，绝对禁止以下行为：
+1. 禁止整句照搬语录原文
+2. 禁止只替换1~3个词后复用原句（例如把"男主"换成角色名，其余一模一样）
+3. 禁止把语录当作填空模板使用
+4. 禁止多条评论都套用同一条语录的句式结构
+5. 每条评论必须是"基于本章具体剧情的原创反应"，而不是语录的改写版
+6. 语录只告诉你"这类读者大概会用什么语气说话"，不告诉你"说什么内容"
+7. 评论的具体内容必须来自本章正文中真实发生的事件、对话、人物行为
+8. 如果语录中有"xxx/某人/A/B"等占位符，必须用当前剧情自然表达替换，禁止原样输出
+
+正确做法示例：
+- 语录原文："啊啊啊我磕到了!!!" → 你应该写："第三段那个眼神交换我直接尖叫，这俩人也太会了"
+- 语录原文："前排催更" → 你应该写："看到这里直接断了？？作者你出来我保证不打你"
+- 错误做法：直接输出"啊啊啊我磕到了!!!"或"啊啊啊xxx我磕到了!!!"
 
 ${examples}`;
 }
@@ -23829,6 +24431,16 @@ function renderSettingsPage(){
       <div class="settings-row">
         <label>默认章节字数</label>
         <input id="defaultChapterWordCountInput" class="row-input-small" type="number" min="500" step="500" value="${Number(s.defaultChapterWordCount||3000)}" />
+      </div>
+      <div class="settings-row">
+        <label>模型最大输出Token</label>
+        <input id="maxTokensInput" class="row-input-small" type="number" min="1000" step="1000" value="${Number(s.maxTokens||6000)}" />
+      </div>
+      <div class="info-line" style="padding:0 0 8px;">
+        小模型（Flash/Mini等）建议设为 2000~4000；<br>
+        中等模型建议 4000~8000；<br>
+        大模型（Pro/4o等）可设 8000~16000。<br>
+        此值同时影响 prompt 压缩强度：越小，注入的上下文越精简。
       </div>
 
       <div class="settings-row vertical">
@@ -28064,6 +28676,58 @@ function openRelationshipRuleEditor(bookId, ruleIndex){
     toast(isEdit ? '规则已更新' : '规则已新增', 'success');
     openRelationshipNetworkManager(bookId, 'rules');
   };
+}
+function importLinkedBookCharactersToRelationshipNetwork(bookId){
+  const book = getBookById(bookId);
+  if(!book) return;
+
+  const network = getRelationshipNetwork(book);
+  network.characters = safeArray(network.characters);
+
+  const existingNames = new Set(
+    network.characters.flatMap(item => getAllCharacterLookupKeys(item)).filter(Boolean)
+  );
+
+  let count = 0;
+
+  safeArray(book.linkedCharacterIds).forEach(charId => {
+    const char = getCharacterById(charId);
+    if(!char) return;
+
+    const normalizedName = normalizePersonDisplayName(char.name || '');
+    if(!normalizedName) return;
+    if(existingNames.has(normalizedName)) return;
+
+    network.characters.push({
+      id: generateId('rchar'),
+      name: normalizedName,
+      alias: char.name && char.name !== normalizedName ? [char.name] : [],
+      gender: char.gender || '',
+      age: char.age || '',
+      lifeStage: '',
+      identity: char.background ? safeLimitText(char.background, 40) : '',
+      camp: '',
+      roleType: '',
+      publicStatus: '',
+      hiddenStatus: '',
+      personality: parseTagInput(char.personality || ''),
+      firstAppearChapter: '',
+      currentStatus: '',
+      tags: safeArray(char.tags),
+      notes: [char.appearance, char.notes].filter(Boolean).join('；')
+    });
+
+    existingNames.add(normalizedName);
+    count++;
+  });
+
+  book.relationshipNetwork = normalizeRelationshipNetwork(network);
+  dedupeRelationshipCharacters(book);
+  book.updatedAt = Date.now();
+  persistAll();
+
+  toast(`已导入 ${count} 名绑定角色到关系网`, 'success');
+  openRelationshipNetworkManager(bookId, 'characters');
 }
 
 function openImportGlobalCharactersToRelationshipNetwork(bookId){
@@ -32473,14 +33137,17 @@ ${quotePromptText}
 3. authorTag 可从：路人、读者、老粉、作者、推文君、吃瓜群众、资深书虫、磕学家 中选
 4. content 10~100 字
 5. 允许少量 replyTo，但不要每条都有
-6. 可适度使用 [表情:名称]
-7. 单条回复最多 1 个表情包
-8. likes 为 0~80 合理分布
-9. 不要输出解释，不要输出 markdown 标题，不要说“以下是生成结果”
-10. 语录库只能参考语气，不可直接照搬整句
-11. 如果参考语录里出现 xxx / 某人 / A / B / 角色 等占位词，必须改写成自然表达，禁止原样输出占位符
-12. 能输出 JSON 就优先输出 JSON
-13. 严禁输出思考过程、推理过程、分析说明、生成策略，只输出最终回复内容`;
+6. 全部回复中至少 2~3 条必须带颜文字或网络口语语气词，例如：(ﾉ>ω<)ﾉ、QAQ、awsl、救命、笑死、哈哈哈哈哈、233333 等
+7. 如果有表情包库，也可以用 [表情:名称] 格式插入
+8. 表情包和颜文字可以混用，大约 30%~40% 的回复带即可
+9. 单条回复最多 1 个表情包 + 1 个颜文字
+10. likes 为 0~80 合理分布
+11. 不要输出解释，不要输出 markdown 标题，不要说"以下是生成结果"
+12. 语录库只能参考语气，不可直接照搬整句
+13. 如果参考语录里出现 xxx / 某人 / A / B / 角色 等占位词，必须改写成自然表达，禁止原样输出占位符
+14. 能输出 JSON 就优先输出 JSON
+15. 严禁输出思考过程、推理过程、分析说明、生成策略，只输出最终回复内容`;
+
 
   const resp = await callChatWithAutoStreamFallbackWithPreset(
     preset,
